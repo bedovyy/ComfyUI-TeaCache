@@ -16,6 +16,7 @@ from comfy.ldm.wan.model import sinusoidal_embedding_1d
 
 SUPPORTED_MODELS_COEFFICIENTS = {
     "flux": [4.98651651e+02, -2.83781631e+02, 5.58554382e+01, -3.82021401e+00, 2.64230861e-01],
+    "chroma": [5.535715302108647, -19.63118005732979, 20.833140594880085, -5.566754356590756, 0.5868468278998409],
     "ltxv": [2.14700694e+01, -1.28016453e+01, 2.31279151e+00, 7.92487521e-01, 9.69274326e-03],
     "hunyuan_video": [7.33226126e+02, -4.01131952e+02, 6.75869174e+01, -3.14987800e+00, 9.61237896e-02],
     "hidream_i1_full": [-3.13605009e+04, -7.12425503e+02, 4.91363285e+01, 8.26515490e+00, 1.08053901e-01],
@@ -34,6 +35,197 @@ def poly1d(coefficients, x):
     for i, coeff in enumerate(coefficients):
         result += coeff * (x ** (len(coefficients) - 1 - i))
     return result
+
+def teacache_chroma_forward(
+    self,
+    img: torch.Tensor,
+    img_ids: torch.Tensor,
+    txt: torch.Tensor,
+    txt_ids: torch.Tensor,
+    timesteps: torch.Tensor,
+    guidance: torch.Tensor = None,
+    control=None,
+    transformer_options={},
+    attn_mask: torch.Tensor = None,
+) -> torch.Tensor:
+    patches_replace = transformer_options.get("patches_replace", {})
+    rel_l1_thresh = transformer_options.get("rel_l1_thresh")
+    coefficients = transformer_options.get("coefficients")
+    enable_teacache = transformer_options.get("enable_teacache", True)
+    cond_or_uncond = transformer_options.get("cond_or_uncond", [0])  # [0,1] for CFG, [0] for non-CFG
+
+    current_percent = transformer_options.get("current_percent", None)
+
+    if img.ndim != 3 or txt.ndim != 3:
+        raise ValueError("Input img and txt tensors must have 3 dimensions.")
+
+    # Initialize data collection buffer if not already present
+    if not hasattr(self, 'teacache_data_collection'):
+        self.teacache_data_collection = {
+            'input_changes': [],
+            'output_changes': []
+        }
+
+    # Initialize group-wise TeaCache state if not already present
+    if not hasattr(self, 'teacache_state'):
+        self.teacache_state = {
+            0: {'should_calc': True, 'accumulated_rel_l1_distance': 0, 'previous_modulated_input': None, 'previous_residual': None, 'previous_output': None},
+            1: {'should_calc': True, 'accumulated_rel_l1_distance': 0, 'previous_modulated_input': None, 'previous_residual': None, 'previous_output': None},
+        }
+
+    # Chroma-style input embedding and modulation vector preparation
+    img = self.img_in(img)
+    mod_index_length = 344
+    distill_timestep = timestep_embedding(timesteps.detach().clone(), 16).to(img.device, img.dtype)
+    distil_guidance = timestep_embedding(guidance.detach().clone(), 16).to(img.device, img.dtype)
+    modulation_index = timestep_embedding(torch.arange(mod_index_length, device=img.device), 32).to(img.device, img.dtype)
+    modulation_index = modulation_index.unsqueeze(0).repeat(img.shape[0], 1, 1).to(img.device, img.dtype)
+    timestep_guidance = torch.cat([distill_timestep, distil_guidance], dim=1).unsqueeze(1).repeat(1, mod_index_length, 1).to(img.dtype).to(img.device, img.dtype)
+    input_vec = torch.cat([timestep_guidance, modulation_index], dim=-1).to(img.device, img.dtype)
+    mod_vectors = self.distilled_guidance_layer(input_vec)
+    txt = self.txt_in(txt)
+    ids = torch.cat((txt_ids, img_ids), dim=1)
+    pe = self.pe_embedder(ids)
+    blocks_replace = patches_replace.get("dit", {})
+
+    # Calculate modulation for the first double block (used for cache decision)
+    double_mod_img, _ = self.get_modulations(mod_vectors, "double_img", idx=0)
+    modulated_inp = self.double_blocks[0].img_norm1(img)
+    modulated_inp = apply_mod(modulated_inp, (1 + double_mod_img.scale), double_mod_img.shift)
+
+    b = int(img.shape[0] / len(cond_or_uncond))
+    input_changes_this_step = {}
+    for i, k in enumerate(cond_or_uncond):
+        cache = self.teacache_state[k]
+        mod_inp = modulated_inp[i*b:(i+1)*b]
+        if cache['previous_modulated_input'] is not None:
+            # Compute input change (x) if possible
+            input_change = ((mod_inp - cache['previous_modulated_input']).abs().mean() /
+                            (cache['previous_modulated_input'].abs().mean() + 1e-8)).item()
+            input_changes_this_step[k] = input_change
+        else:
+            input_changes_this_step[k] = None
+        # Update cache state for each group
+        if cache['previous_modulated_input'] is not None:
+            try:
+                cache['accumulated_rel_l1_distance'] += poly1d(coefficients, ((mod_inp - cache['previous_modulated_input']).abs().mean() /
+                                                                              (cache['previous_modulated_input'].abs().mean() + 1e-8)))
+                if cache['accumulated_rel_l1_distance'] < rel_l1_thresh:
+                    cache['should_calc'] = False
+                else:
+                    cache['should_calc'] = True
+                    cache['accumulated_rel_l1_distance'] = 0
+            except Exception:
+                cache['should_calc'] = True
+                cache['accumulated_rel_l1_distance'] = 0
+        else:
+            cache['should_calc'] = True
+            cache['accumulated_rel_l1_distance'] = 0
+        cache['previous_modulated_input'] = mod_inp
+
+    if not enable_teacache:
+        should_calc = True
+    else:
+        should_calc = any(self.teacache_state[k]['should_calc'] for k in cond_or_uncond)
+
+    if not should_calc:
+        for i, k in enumerate(cond_or_uncond):
+            if k == 0:
+                print(f"[TeaCache] step (timestep={timesteps[i*b].item()} group={k}): SKIP (use cache) | acc_rel_l1={self.teacache_state[k]['accumulated_rel_l1_distance']:.4f}")
+            img[i*b:(i+1)*b] += self.teacache_state[k]['previous_residual'].to(img.device)
+            self.teacache_state[k]['previous_output'] = img[i*b:(i+1)*b].detach().clone()
+    else:
+        #print(f"[TeaCache] step (timestep={timesteps[0].item()}): CALC (recompute)")
+        ori_img = img.clone()
+        for i, block in enumerate(self.double_blocks):
+            if i not in self.skip_mmdit:
+                double_mod = (
+                    self.get_modulations(mod_vectors, "double_img", idx=i),
+                    self.get_modulations(mod_vectors, "double_txt", idx=i),
+                )
+                if ("double_block", i) in blocks_replace:
+                    def block_wrap(args):
+                        out = {}
+                        out["img"], out["txt"] = block(
+                            img=args["img"],
+                            txt=args["txt"],
+                            vec=args["vec"],
+                            pe=args["pe"],
+                            attn_mask=args.get("attn_mask"),
+                        )
+                        return out
+                    out = blocks_replace[("double_block", i)](
+                        {"img": img, "txt": txt, "vec": double_mod, "pe": pe, "attn_mask": attn_mask},
+                        {"original_block": block_wrap}
+                    )
+                    txt = out["txt"]
+                    img = out["img"]
+                else:
+                    img, txt = block(img=img, txt=txt, vec=double_mod, pe=pe, attn_mask=attn_mask)
+            if control is not None:
+                control_i = control.get("input")
+                if i < len(control_i):
+                    add = control_i[i]
+                    if add is not None:
+                        img += add
+        img = torch.cat((txt, img), 1)
+        for i, block in enumerate(self.single_blocks):
+            if i not in self.skip_dit:
+                single_mod = self.get_modulations(mod_vectors, "single", idx=i)
+                if ("single_block", i) in blocks_replace:
+                    def block_wrap(args):
+                        out = {}
+                        out["img"] = block(
+                            args["img"],
+                            vec=args["vec"],
+                            pe=args["pe"],
+                            attn_mask=args.get("attn_mask"),
+                        )
+                        return out
+                    out = blocks_replace[("single_block", i)](
+                        {"img": img, "vec": single_mod, "pe": pe, "attn_mask": attn_mask},
+                        {"original_block": block_wrap}
+                    )
+                    img = out["img"]
+                else:
+                    img = block(img, vec=single_mod, pe=pe, attn_mask=attn_mask)
+            if control is not None:
+                control_o = control.get("output")
+                if i < len(control_o):
+                    add = control_o[i]
+                    if add is not None:
+                        img[:, txt.shape[1]:, ...] += add
+        # Remove text tokens before residual calculation
+        img = img[:, txt.shape[1]:, ...]
+        # Compute output change (y)
+        for i, k in enumerate(cond_or_uncond):
+            cache = self.teacache_state[k]
+            current_output = img[i*b:(i+1)*b].detach().clone()
+            if cache['previous_output'] is not None and input_changes_this_step[k] is not None and k == 0:
+                output_change = ((current_output - cache['previous_output']).abs().mean() /
+                                 (cache['previous_output'].abs().mean() + 1e-8)).item()
+                self.teacache_data_collection['input_changes'].append(input_changes_this_step[k])
+                self.teacache_data_collection['output_changes'].append(output_change)
+                print(f"[TeaCache Data] timestep={timesteps[i*b].item()} group={k}: x={input_changes_this_step[k]:.6f}, y={output_change:.6f} current_percent={current_percent}")
+            cache['previous_output'] = current_output
+            cache['previous_residual'] = (img[i*b:(i+1)*b] - ori_img[i*b:(i+1)*b]).to(mm.unet_offload_device())
+
+    # Final modulation and output
+    final_mod = self.get_modulations(mod_vectors, "final")
+    img = self.final_layer(img, vec=final_mod)
+
+    # If this is the last step, fit and print coefficients
+    if current_percent >= 0.95 : # assume it is last step
+        import numpy as np
+        x = np.array(self.teacache_data_collection['input_changes'])
+        y = np.array(self.teacache_data_collection['output_changes'])
+        if len(x) >= 5:
+            coeffs = np.polyfit(x, y, 4)
+            print(f"[TeaCache] Calculated coefficients (degree 4): {coeffs.tolist()}")
+        else:
+            print("[TeaCache] Not enough data to fit coefficients.")
+
+    return img
 
 def teacache_flux_forward(
         self,
@@ -758,7 +950,7 @@ class TeaCache:
         return {
             "required": {
                 "model": ("MODEL", {"tooltip": "The diffusion model the TeaCache will be applied to."}),
-                "model_type": (["flux", "ltxv", "hunyuan_video", "hidream_i1_full", "wan2.1_t2v_1.3B", "wan2.1_t2v_14B", "wan2.1_i2v_480p_14B", "wan2.1_i2v_720p_14B", "wan2.1_t2v_1.3B_ret_mode", "wan2.1_t2v_14B_ret_mode", "wan2.1_i2v_480p_14B_ret_mode", "wan2.1_i2v_720p_14B_ret_mode"], {"default": "flux", "tooltip": "Supported diffusion model."}),
+                "model_type": (["chroma", "flux", "ltxv", "hunyuan_video", "hidream_i1_full", "wan2.1_t2v_1.3B", "wan2.1_t2v_14B", "wan2.1_i2v_480p_14B", "wan2.1_i2v_720p_14B", "wan2.1_t2v_1.3B_ret_mode", "wan2.1_t2v_14B_ret_mode", "wan2.1_i2v_480p_14B_ret_mode", "wan2.1_i2v_720p_14B_ret_mode"], {"default": "chroma", "tooltip": "Supported diffusion model."}),
                 "rel_l1_thresh": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "How strongly to cache the output of diffusion model. This value must be non-negative."}),
                 "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "The start percentage of the steps that will apply TeaCache."}),
                 "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "The end percentage of the steps that will apply TeaCache."})
@@ -783,7 +975,13 @@ class TeaCache:
         new_model.model_options["transformer_options"]["use_ret_mode"] = "ret_mode" in model_type
         diffusion_model = new_model.get_model_object("diffusion_model")
 
-        if "flux" in model_type:
+        if "chroma" in model_type:
+            is_cfg = True
+            context = patch.multiple(
+                diffusion_model,
+                forward_orig=teacache_chroma_forward.__get__(diffusion_model, diffusion_model.__class__)
+            )
+        elif "flux" in model_type:
             is_cfg = False
             context = patch.multiple(
                 diffusion_model,

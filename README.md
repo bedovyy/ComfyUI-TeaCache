@@ -1,5 +1,12 @@
 # ComfyUI-TeaCache
 
+## For Testing AI-Generated Chroma Model Support
+Code to support [Chroma](https://huggingface.co/lodestones/Chroma) was generated using AI. Additional code for calculating coefficients is included.
+
+The code has not been verified for correct operation, nor have the coefficient values been validated.
+
+The recommended settings are: `rel l1` 0.2, `start` 0.1, `end` 1.0.
+
 ## Introduction
 Timestep Embedding Aware Cache ([TeaCache](https://github.com/ali-vilab/TeaCache)) is a training-free caching approach that estimates and leverages the fluctuating differences among model outputs across timesteps, thereby accelerating the inference. TeaCache works well for Image Diffusion models, Video Diffusion Models, and Audio Diffusion Models.
 
