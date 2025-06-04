@@ -16,7 +16,8 @@ from comfy.ldm.wan.model import sinusoidal_embedding_1d
 
 SUPPORTED_MODELS_COEFFICIENTS = {
     "flux": [4.98651651e+02, -2.83781631e+02, 5.58554382e+01, -3.82021401e+00, 2.64230861e-01],
-    "chroma": [5.535715302108647, -19.63118005732979, 20.833140594880085, -5.566754356590756, 0.5868468278998409],
+#    "chroma": [5.535715302108647, -19.63118005732979, 20.833140594880085, -5.566754356590756, 0.5868468278998409],
+    "chroma": [-0.25082446069070197, 7.8547387294434685, -0.8810166774980689, -0.5896453471809904, 0.26392784122665264],
     "ltxv": [2.14700694e+01, -1.28016453e+01, 2.31279151e+00, 7.92487521e-01, 9.69274326e-03],
     "hunyuan_video": [7.33226126e+02, -4.01131952e+02, 6.75869174e+01, -3.14987800e+00, 9.61237896e-02],
     "hidream_i1_full": [-3.13605009e+04, -7.12425503e+02, 4.91363285e+01, 8.26515490e+00, 1.08053901e-01],
@@ -52,28 +53,22 @@ def teacache_chroma_forward(
     rel_l1_thresh = transformer_options.get("rel_l1_thresh")
     coefficients = transformer_options.get("coefficients")
     enable_teacache = transformer_options.get("enable_teacache", True)
-    cond_or_uncond = transformer_options.get("cond_or_uncond", [0])  # [0,1] for CFG, [0] for non-CFG
-
+    cond_or_uncond = transformer_options.get("cond_or_uncond", [0])
     current_percent = transformer_options.get("current_percent", None)
+    debug_teacache = transformer_options.get("debug_teacache", False)
 
     if img.ndim != 3 or txt.ndim != 3:
         raise ValueError("Input img and txt tensors must have 3 dimensions.")
 
-    # Initialize data collection buffer if not already present
     if not hasattr(self, 'teacache_data_collection'):
-        self.teacache_data_collection = {
-            'input_changes': [],
-            'output_changes': []
-        }
+        self.teacache_data_collection = {'input_changes': [], 'output_changes': []}
 
-    # Initialize group-wise TeaCache state if not already present
     if not hasattr(self, 'teacache_state'):
         self.teacache_state = {
-            0: {'should_calc': True, 'accumulated_rel_l1_distance': 0, 'previous_modulated_input': None, 'previous_residual': None, 'previous_output': None},
-            1: {'should_calc': True, 'accumulated_rel_l1_distance': 0, 'previous_modulated_input': None, 'previous_residual': None, 'previous_output': None},
+            0: {'should_calc': True, 'accumulated_rel_l1_distance': 0, 'previous_modulated_input': None, 'previous_output': None},
+            1: {'should_calc': True, 'accumulated_rel_l1_distance': 0, 'previous_modulated_input': None, 'previous_output': None},
         }
 
-    # Chroma-style input embedding and modulation vector preparation
     img = self.img_in(img)
     mod_index_length = 344
     distill_timestep = timestep_embedding(timesteps.detach().clone(), 16).to(img.device, img.dtype)
@@ -88,7 +83,6 @@ def teacache_chroma_forward(
     pe = self.pe_embedder(ids)
     blocks_replace = patches_replace.get("dit", {})
 
-    # Calculate modulation for the first double block (used for cache decision)
     double_mod_img, _ = self.get_modulations(mod_vectors, "double_img", idx=0)
     modulated_inp = self.double_blocks[0].img_norm1(img)
     modulated_inp = apply_mod(modulated_inp, (1 + double_mod_img.scale), double_mod_img.shift)
@@ -98,14 +92,12 @@ def teacache_chroma_forward(
     for i, k in enumerate(cond_or_uncond):
         cache = self.teacache_state[k]
         mod_inp = modulated_inp[i*b:(i+1)*b]
-        if cache['previous_modulated_input'] is not None:
-            # Compute input change (x) if possible
+        if debug_teacache and cache['previous_modulated_input'] is not None:
             input_change = ((mod_inp - cache['previous_modulated_input']).abs().mean() /
                             (cache['previous_modulated_input'].abs().mean() + 1e-8)).item()
             input_changes_this_step[k] = input_change
         else:
             input_changes_this_step[k] = None
-        # Update cache state for each group
         if cache['previous_modulated_input'] is not None:
             try:
                 cache['accumulated_rel_l1_distance'] += poly1d(coefficients, ((mod_inp - cache['previous_modulated_input']).abs().mean() /
@@ -123,6 +115,8 @@ def teacache_chroma_forward(
             cache['accumulated_rel_l1_distance'] = 0
         cache['previous_modulated_input'] = mod_inp
 
+    text_len = txt.shape[1]
+
     if not enable_teacache:
         should_calc = True
     else:
@@ -130,12 +124,19 @@ def teacache_chroma_forward(
 
     if not should_calc:
         for i, k in enumerate(cond_or_uncond):
-            if k == 0:
-                print(f"[TeaCache] step (timestep={timesteps[i*b].item()} group={k}): SKIP (use cache) | acc_rel_l1={self.teacache_state[k]['accumulated_rel_l1_distance']:.4f}")
-            img[i*b:(i+1)*b] += self.teacache_state[k]['previous_residual'].to(img.device)
-            self.teacache_state[k]['previous_output'] = img[i*b:(i+1)*b].detach().clone()
-    else:
-        #print(f"[TeaCache] step (timestep={timesteps[0].item()}): CALC (recompute)")
+            cache = self.teacache_state[k]
+            if debug_teacache:
+                print(
+                    f"[TeaCache] step (timestep={timesteps[i*b].item()} group={k}): "
+                    f"SKIP (use cache) | acc_rel_l1={cache['accumulated_rel_l1_distance']:.4f} "
+                    f"| rel_l1_thresh={rel_l1_thresh:.4f}"
+                )
+            if cache['previous_output'] is not None:
+                img[i*b:(i+1)*b] = cache['previous_output'].clone()
+            else:
+                cache['should_calc'] = True
+                should_calc = True
+    if should_calc:
         ori_img = img.clone()
         for i, block in enumerate(self.double_blocks):
             if i not in self.skip_mmdit:
@@ -194,28 +195,29 @@ def teacache_chroma_forward(
                 if i < len(control_o):
                     add = control_o[i]
                     if add is not None:
-                        img[:, txt.shape[1]:, ...] += add
-        # Remove text tokens before residual calculation
-        img = img[:, txt.shape[1]:, ...]
-        # Compute output change (y)
+                        img[:, text_len:, ...] += add
+        img = img[:, text_len:, ...]
         for i, k in enumerate(cond_or_uncond):
             cache = self.teacache_state[k]
             current_output = img[i*b:(i+1)*b].detach().clone()
-            if cache['previous_output'] is not None and input_changes_this_step[k] is not None and k == 0:
+            if (
+                debug_teacache
+                and cache['previous_output'] is not None
+                and input_changes_this_step[k] is not None
+                and k == 0
+                and enable_teacache
+            ):
                 output_change = ((current_output - cache['previous_output']).abs().mean() /
                                  (cache['previous_output'].abs().mean() + 1e-8)).item()
                 self.teacache_data_collection['input_changes'].append(input_changes_this_step[k])
                 self.teacache_data_collection['output_changes'].append(output_change)
                 print(f"[TeaCache Data] timestep={timesteps[i*b].item()} group={k}: x={input_changes_this_step[k]:.6f}, y={output_change:.6f} current_percent={current_percent}")
             cache['previous_output'] = current_output
-            cache['previous_residual'] = (img[i*b:(i+1)*b] - ori_img[i*b:(i+1)*b]).to(mm.unet_offload_device())
 
-    # Final modulation and output
     final_mod = self.get_modulations(mod_vectors, "final")
     img = self.final_layer(img, vec=final_mod)
 
-    # If this is the last step, fit and print coefficients
-    if current_percent >= 0.95 : # assume it is last step
+    if debug_teacache and current_percent is not None and current_percent >= 0.95:
         import numpy as np
         x = np.array(self.teacache_data_collection['input_changes'])
         y = np.array(self.teacache_data_collection['output_changes'])
@@ -226,6 +228,7 @@ def teacache_chroma_forward(
             print("[TeaCache] Not enough data to fit coefficients.")
 
     return img
+
 
 def teacache_flux_forward(
         self,
